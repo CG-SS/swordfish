@@ -1,0 +1,30 @@
+# `switch` and `group_by` share a config shape and a routing rule, and they are
+# NOT the same processor. swordfish registered one as a clone of the other, so
+# every `switch` re-ordered and re-batched what it touched.
+#
+#   switch   returns ONE batch, restored to the order it arrived in
+#            (benthos-main/internal/impl/pure/processor_switch.go:170-245)
+#   group_by returns one batch PER GROUP, in group order, unmatched last
+#            (benthos-main/internal/impl/pure/processor_group_by.go:127-176)
+#
+# `swordfish test` is the only gate that can see this: stdout flattens batches,
+# so the two are indistinguishable there. Verified to pass under
+# redpanda-connect 4.107.2 as well.
+pipeline:
+  processors:
+    - switch:
+        - check: 'this.t == "b"'
+          processors:
+            - mapping: 'root = this.merge({"seen": true})'
+tests:
+  - name: switch returns one batch in the incoming order
+    input_batch:
+      - content: '{"t":"a","n":1}'
+      - content: '{"t":"b","n":2}'
+      - content: '{"t":"a","n":3}'
+      - content: '{"t":"b","n":4}'
+    output_batches:
+      - - json_equals: { "t": "a", "n": 1 }
+        - json_equals: { "t": "b", "n": 2, "seen": true }
+        - json_equals: { "t": "a", "n": 3 }
+        - json_equals: { "t": "b", "n": 4, "seen": true }

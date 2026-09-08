@@ -1,0 +1,109 @@
+From: Swordfish <swordfish@localhost>
+Subject: [PATCH 1/1] httpd: tell a handler when its client has disconnected
+
+seastar's httpd gives a request handler no way to learn that the client has gone.
+For an ordinary request that does not matter -- the reply is written and the
+handler returns. For a LONG-LIVED body, written through reply::write_body(), it
+matters a great deal: a peer that sends FIN leaves the socket writable, so writes
+keep succeeding into a connection nobody is reading, and the handler runs until
+the server is stopped.
+
+In Swordfish this made the `http_server` OUTPUT lose data. Its `stream_path`
+clients pop batches from one shared queue, so a handler whose client had died
+kept taking batches and acknowledging them as delivered. Measured: with two
+clients, one killed, the survivor received every other message and the pipeline
+reported all of them acked. redpanda-connect does not have this problem because
+Go's net/http cancels the request context on disconnect.
+
+The information already exists inside seastar: connection::read() ends exactly
+when the client's read side is gone, which is what sets `_done`. This patch only
+makes that observable, in the smallest way we could find:
+
+  * connection gains an abort_source, aborted once where the read loop ends --
+    one hook covering every `_done = true` site, including the error paths.
+  * request gains a pointer to it, `client_gone`, set by the server when it
+    hands the parsed request over. It is null on a client-side request, which
+    has no such thing.
+
+Nothing existing changes behaviour: the abort_source is only signalled, and only
+a handler that looks at `client_gone` can notice.
+
+Upstreamable in principle. If a future seastar exposes an equivalent -- a
+per-request abort source or a disconnect future -- drop this patch and use it.
+
+--- a/include/seastar/http/request.hh
++++ b/include/seastar/http/request.hh
+@@ -44,6 +44,8 @@
+ 
+ namespace seastar {
+ 
++class abort_source;
++
+ namespace http {
+ 
+ class connection;
+@@ -59,6 +61,18 @@
+ 
+     socket_address _client_address;
+     socket_address _server_address;
++    /// \brief Aborted when the client closes its end of the connection.
++    ///
++    /// Set by the HTTP server on a server-side request, and null otherwise (a
++    /// client-side request has no such thing). A handler writing a long-lived
++    /// response body -- a chunked stream, say -- otherwise has no way to learn
++    /// that its reader has gone: a peer that sends FIN leaves the socket
++    /// writable, so writes keep succeeding into a connection nobody is reading,
++    /// and the handler runs until the server is stopped.
++    ///
++    /// The server's read fiber already discovers this (it is what ends the read
++    /// loop and sets `_done`); this only makes the discovery observable.
++    abort_source* client_gone = nullptr;
+     sstring _method;
+     sstring _url;
+     sstring _version;
+--- a/include/seastar/http/httpd.hh
++++ b/include/seastar/http/httpd.hh
+@@ -27,6 +27,7 @@
+ #include <vector>
+ #include <optional>
+ #include <boost/intrusive/list.hpp>
++#include <seastar/core/abort_source.hh>
+ #include <seastar/http/request_parser.hh>
+ #include <seastar/http/request.hh>
+ #include <seastar/core/seastar.hh>
+@@ -75,6 +76,11 @@
+     // null element marks eof
+     queue<std::unique_ptr<http::reply>> _replies { 10 };
+     bool _done = false;
++    // Aborted when this connection's read side ends -- EOF from the client, or a
++    // read error. Handed to each request as `request::client_gone` so a handler
++    // writing a long-lived body can stop when its reader has gone; see the
++    // comment on that field.
++    abort_source _client_gone;
+     const bool _tls;
+ public:
+     connection(http_server& server, connected_socket&& fd, bool tls)
+--- a/src/http/httpd.cc
++++ b/src/http/httpd.cc
+@@ -142,6 +142,13 @@
+             _server._read_errors++;
+         }
+         f.ignore_ready_future();
++        // The read loop ends exactly when this connection's client is gone --
++        // EOF, or a read error -- whichever of the several `_done = true` sites
++        // fired. One hook here therefore covers all of them, including the error
++        // paths, and a handler still writing a body can observe it.
++        if (!_client_gone.abort_requested()) {
++            _client_gone.request_abort();
++        }
+         return _replies.push_eventually( {});
+     });
+ }
+@@ -204,6 +211,7 @@
+ 
+         req->_server_address = this->_server_addr;
+         req->_client_address = this->_client_addr;
++        req->client_gone = &this->_client_gone;
+ 
+         if (_tls) {
+             req->protocol_name = "https";

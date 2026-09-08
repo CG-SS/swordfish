@@ -1,0 +1,121 @@
+From: Swordfish <swordfish@localhost>
+Subject: [PATCH 2/2] Generic: bound the reader's recursion and its declared counts
+
+avro-cpp's GenericReader::read decodes a datum by recursing once per level of
+nesting, with nothing to stop it, and sizes an array or map from a count the
+FILE declares before reading a single element. Both are reachable from any OCF
+file, which is untrusted input for Swordfish's `avro` scanner.
+
+  * DEPTH. A schema may be self-referential -- {"name":"N", ... {"name":"next",
+    "type":["null","N"]}} -- so the schema is finite while the DATA's nesting is
+    bounded only by the file. A 400 KB file nested 200,000 deep SEGFAULTS the
+    process. Measured on a Seastar shard stack: 8,000 levels decode fine, 20,000
+    crash. redpanda-connect refuses the same file with a named error and exits 0.
+
+  * DECLARED COUNTS. `r.resize(r.size() + m)` with `m` straight from
+    d.arrayStart() means a 167-byte file declaring an array of 2^40 ints asks
+    for terabytes before discovering the elements are not there. The same shape
+    is in the map case.
+
+The depth limit is 1000, far above any real record and far below any stack this
+runs on. The counts are no longer allocated up front: the vectors grow as
+elements are actually decoded, which costs an amortised reallocation on a large
+legitimate array and removes the claim-a-terabyte case entirely. Semantics are
+otherwise unchanged -- the same elements are read in the same order.
+
+This could not be done on Swordfish's side. The recursion and the allocation are
+both inside the dependency, and the nesting depth of a datum is not knowable
+without decoding it, so there is nothing to check before handing the bytes over.
+
+DROP THIS PATCH when upstream bounds either one. Apache Avro tracks this kind of
+hardening; check AVRO's JIRA for a depth or size limit on the C++ generic reader
+before carrying it into the next release.
+---
+--- a/impl/Generic.cc
++++ b/impl/Generic.cc
+@@ -48,7 +48,19 @@
+     read(datum, *decoder_, isResolving_);
+ }
+ 
+-void GenericReader::read(GenericDatum &datum, Decoder &d, bool isResolving) {
++// The deepest nesting this will decode. A schema can be self-referential, so
++// the DATA's depth is bounded by the file rather than by the schema, and this
++// function recurses once per level. On a Seastar shard stack the crash arrived
++// somewhere between 8,000 and 20,000 levels; 1,000 is far above any real record
++// and far below any stack this runs on.
++static const size_t maxRecursionDepth = 1000;
++
++void GenericReader::read(GenericDatum &datum, Decoder &d, bool isResolving,
++                         size_t depth) {
++    if (depth > maxRecursionDepth) {
++        throw Exception("Datum nesting is deeper than {} levels", maxRecursionDepth);
++    }
++    ++depth;
+     if (datum.isUnion()) {
+         datum.selectBranch(d.decodeUnionIndex());
+     }
+@@ -88,11 +100,11 @@
+                 std::vector<size_t> fo =
+                     static_cast<ResolvingDecoder &>(d).fieldOrder();
+                 for (size_t i = 0; i < c; ++i) {
+-                    read(r.fieldAt(fo[i]), d, isResolving);
++                    read(r.fieldAt(fo[i]), d, isResolving, depth);
+                 }
+             } else {
+                 for (size_t i = 0; i < c; ++i) {
+-                    read(r.fieldAt(i), d, isResolving);
++                    read(r.fieldAt(i), d, isResolving, depth);
+                 }
+             }
+         } break;
+@@ -104,12 +116,10 @@
+             vector<GenericDatum> &r = v.value();
+             const NodePtr &nn = v.schema()->leafAt(0);
+             r.resize(0);
+-            size_t start = 0;
+             for (size_t m = d.arrayStart(); m != 0; m = d.arrayNext()) {
+-                r.resize(r.size() + m);
+-                for (; start < r.size(); ++start) {
+-                    r[start] = GenericDatum(nn);
+-                    read(r[start], d, isResolving);
++                for (size_t i = 0; i < m; ++i) {
++                    r.push_back(GenericDatum(nn));
++                    read(r.back(), d, isResolving, depth);
+                 }
+             }
+         } break;
+@@ -118,13 +128,11 @@
+             GenericMap::Value &r = v.value();
+             const NodePtr &nn = v.schema()->leafAt(1);
+             r.resize(0);
+-            size_t start = 0;
+             for (size_t m = d.mapStart(); m != 0; m = d.mapNext()) {
+-                r.resize(r.size() + m);
+-                for (; start < r.size(); ++start) {
+-                    d.decodeString(r[start].first);
+-                    r[start].second = GenericDatum(nn);
+-                    read(r[start].second, d, isResolving);
++                for (size_t i = 0; i < m; ++i) {
++                    r.emplace_back(std::string(), GenericDatum(nn));
++                    d.decodeString(r.back().first);
++                    read(r.back().second, d, isResolving, depth);
+                 }
+             }
+         } break;
+--- a/include/avro/Generic.hh
++++ b/include/avro/Generic.hh
+@@ -34,7 +34,13 @@
+     const bool isResolving_;
+     const DecoderPtr decoder_;
+ 
+-    static void read(GenericDatum &datum, Decoder &d, bool isResolving);
++    // `depth` bounds the recursion. A self-referential schema makes the
++    // NESTING of the data unbounded even though the schema is finite, and this
++    // function recurses once per level with nothing to stop it -- so a small
++    // hostile file segfaults the process. See patches/0002 in the Swordfish
++    // tree for the whole story.
++    static void read(GenericDatum &datum, Decoder &d, bool isResolving,
++                     size_t depth = 0);
+ 
+ public:
+     /**

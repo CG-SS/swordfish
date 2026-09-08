@@ -1,0 +1,70 @@
+# Batch-shaping processors, in the Benthos unit-test format so the assertions
+# are on batch STRUCTURE, not just concatenated output. Verified to pass under
+# redpanda-connect 4.107.2 as well: stdout flattens batches, so a comparison
+# through it cannot tell one batch of four from two batches of two.
+pipeline:
+  processors:
+    - split:
+        size: 2
+tests:
+  - name: split makes two batches of two
+    input_batch:
+      - content: 'a'
+      - content: 'b'
+      - content: 'c'
+      - content: 'd'
+    output_batches:
+      - - content_equals: 'a'
+        - content_equals: 'b'
+      - - content_equals: 'c'
+        - content_equals: 'd'
+
+  - name: split leaves a short final batch
+    target_processors: /pipeline/processors
+    input_batch:
+      - content: 'a'
+      - content: 'b'
+      - content: 'c'
+    output_batches:
+      - - content_equals: 'a'
+        - content_equals: 'b'
+      - - content_equals: 'c'
+
+  - name: select_parts keeps the listed indices in order
+    target_processors: /processor_resources/0
+    input_batch:
+      - content: 'a'
+      - content: 'b'
+      - content: 'c'
+    output_batches:
+      - - content_equals: 'c'
+        - content_equals: 'a'
+
+  - name: bounds_check drops the batch when one message is undersized
+    target_processors: /processor_resources/1
+    input_batch:
+      - content: 'ab'
+      - content: 'c'
+    output_batches: []
+
+  - name: insert_part appends at -1
+    target_processors: /processor_resources/2
+    input_batch:
+      - content: 'a'
+      - content: 'b'
+    output_batches:
+      - - content_equals: 'a'
+        - content_equals: 'b'
+        - content_equals: 'X'
+
+processor_resources:
+  - label: sel
+    select_parts:
+      parts: [2, 0]
+  - label: bc
+    bounds_check:
+      min_part_size: 2
+  - label: ins
+    insert_part:
+      index: -1
+      content: X

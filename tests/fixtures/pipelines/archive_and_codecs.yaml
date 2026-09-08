@@ -1,0 +1,50 @@
+# archive and the compression codecs. Verified to pass under
+# redpanda-connect 4.107.2 as well.
+#
+# The round trip below proves compress and decompress are inverses of each
+# OTHER, which is not the same as interoperating with the reference. That was
+# checked separately by comparing the compressed bytes directly: snappy is
+# byte-identical, and gzip/zlib/flate/lz4 differ only in legal header and
+# strategy choices that both decoders accept. A file-based cross-check is not
+# the way to verify it -- the file output appends a newline per message (as the
+# reference's does), which corrupts a binary frame.
+pipeline:
+  processors:
+    - archive:
+        format: json_array
+tests:
+  - name: json_array combines the batch
+    input_batch:
+      - content: '{"a":1}'
+      - content: '{"b":2}'
+    output_batches:
+      - - json_equals: [ {"a":1}, {"b":2} ]
+  - name: lines joins with newlines
+    target_processors: /processor_resources/0
+    input_batch:
+      - content: 'one'
+      - content: 'two'
+    output_batches:
+      - - content_equals: "one\ntwo"
+  - name: concatenate joins with nothing
+    target_processors: /processor_resources/1
+    input_batch:
+      - content: 'ab'
+      - content: 'cd'
+    output_batches:
+      - - content_equals: 'abcd'
+  - name: compress then decompress round-trips
+    target_processors: /processor_resources/2
+    input_batch:
+      - content: 'hello compression world'
+    output_batches:
+      - - content_equals: 'hello compression world'
+processor_resources:
+  - label: al
+    archive: { format: lines }
+  - label: ac
+    archive: { format: concatenate }
+  - label: rt
+    try:
+      - compress: { algorithm: gzip }
+      - decompress: { algorithm: gzip }

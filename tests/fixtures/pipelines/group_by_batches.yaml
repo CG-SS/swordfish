@@ -1,0 +1,21 @@
+# The other half of switch_vs_group_by.yaml: the same config shape under
+# `group_by` must produce one batch PER GROUP, matched first and unmatched last.
+# Verified to pass under redpanda-connect 4.107.2 as well.
+pipeline:
+  processors:
+    - group_by:
+        - check: 'this.t == "b"'
+          processors:
+            - mapping: 'root = this.merge({"seen": true})'
+tests:
+  - name: group_by returns a batch per group, unmatched last
+    input_batch:
+      - content: '{"t":"a","n":1}'
+      - content: '{"t":"b","n":2}'
+      - content: '{"t":"a","n":3}'
+      - content: '{"t":"b","n":4}'
+    output_batches:
+      - - json_equals: { "t": "b", "n": 2, "seen": true }
+        - json_equals: { "t": "b", "n": 4, "seen": true }
+      - - json_equals: { "t": "a", "n": 1 }
+        - json_equals: { "t": "a", "n": 3 }

@@ -1,0 +1,42 @@
+# `deleted()` in a request_map SKIPS a branch: the message passes through
+# untouched, and the branch is recorded under `skipped` rather than `succeeded`.
+#
+# The distinction is not cosmetic. The reference reads a message's existing
+# outcome record to decide which branches still need running on a replay, and
+# treats `succeeded` and `skipped` alike as "already dealt with" — but a branch
+# filed under `succeeded` when it never ran is a claim about work that did not
+# happen, and the two lists are what a human reads to tell a conditional branch
+# from a completed one.
+#
+# Swordfish filed skips under `succeeded` until this was compared against the
+# real binary. Verified to pass under redpanda-connect 4.107.2 as well.
+pipeline:
+  processors:
+    - workflow:
+        order: [ [ maybe ] ]
+        branches:
+          maybe:
+            request_map: 'root = if this.n > 100 { this.n } else { deleted() }'
+            processors: [ { mapping: 'root = {"big": this}' } ]
+            result_map: 'root.big = this.big'
+tests:
+  - name: a branch declined with deleted() is skipped, not succeeded
+    input_batch:
+      - content: '{"n":1}'
+    output_batches:
+      - - json_equals:
+            n: 1
+            meta:
+              workflow:
+                skipped: [ "maybe" ]
+
+  - name: the same branch runs and succeeds when its check passes
+    input_batch:
+      - content: '{"n":200}'
+    output_batches:
+      - - json_equals:
+            n: 200
+            big: 200
+            meta:
+              workflow:
+                succeeded: [ "maybe" ]

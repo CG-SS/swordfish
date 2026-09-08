@@ -1,0 +1,23 @@
+# group_by: first matching check wins; unmatched pass through untouched at
+# the end. Verified to pass under redpanda-connect 4.107.2 as well.
+pipeline:
+  processors:
+    - group_by:
+        - check: 'this.n < 10'
+          processors:
+            - mapping: 'root.tag = "small"'
+        - check: 'this.n < 100'
+          processors:
+            - mapping: 'root.tag = "medium"'
+tests:
+  - name: first matching group wins and unmatched pass through last
+    input_batch:
+      - content: '{"n":5}'
+      - content: '{"n":50}'
+      - content: '{"n":500}'
+      - content: '{"n":7}'
+    output_batches:
+      - - json_equals: { "tag": "small" }
+        - json_equals: { "tag": "small" }
+      - - json_equals: { "tag": "medium" }
+      - - json_equals: { "n": 500 }

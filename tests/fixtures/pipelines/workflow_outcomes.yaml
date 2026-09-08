@@ -1,0 +1,45 @@
+# The SHAPE of a workflow's outcome record, which is the reference's and whose
+# every part is load-bearing:
+#
+#   { "succeeded": ["a"], "skipped": ["b"], "failed": { "c": "why" } }
+#
+# `succeeded` and `skipped` are SORTED arrays of names, `failed` is an OBJECT of
+# name -> error message, and an empty one is omitted rather than written as [].
+# A replay that re-runs only the unfinished branches reads exactly these three
+# keys, so a branch filed under the wrong one would be re-run or skipped wrongly
+# on the next pass.
+#
+# Swordfish recorded all three wrongly until this was compared against the real
+# binary: skipped branches went into `succeeded`, `failed` was an array of bare
+# names with the error thrown away, and the order was the order the branches ran
+# rather than sorted. Each case below pins one of those.
+#
+# Verified to pass under redpanda-connect 4.107.2 as well, which is the point:
+# these assert the reference's shape, not ours.
+pipeline:
+  processors:
+    - workflow:
+        # `zz` runs FIRST and must still be recorded after `aa`. Sorting is what
+        # this pins and what the ordinary two-branch fixture cannot.
+        order: [ [ zz, aa ] ]
+        branches:
+          zz:
+            request_map: 'root = this.id'
+            processors: [ { mapping: 'root = {"v": "z"}' } ]
+            result_map: 'root.zz = this.v'
+          aa:
+            request_map: 'root = this.id'
+            processors: [ { mapping: 'root = {"v": "a"}' } ]
+            result_map: 'root.aa = this.v'
+tests:
+  - name: succeeded is sorted by name, not by the order the branches ran
+    input_batch:
+      - content: '{"id":"1"}'
+    output_batches:
+      - - json_equals:
+            id: "1"
+            zz: "z"
+            aa: "a"
+            meta:
+              workflow:
+                succeeded: [ "aa", "zz" ]

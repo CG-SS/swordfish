@@ -1,0 +1,34 @@
+# branch: the enrichment pattern. The two cases below are the semantics most
+# easily got wrong -- the result MERGES into the original rather than
+# replacing it, and a deleted() request_map skips a message untouched.
+# Verified to pass under redpanda-connect 4.107.2 as well.
+pipeline:
+  processors:
+    - branch:
+        request_map: 'root = this.id'
+        processors:
+          - mapping: 'root = {"looked_up": "value-" + content().string()}'
+        result_map: 'root.enriched = this.looked_up'
+tests:
+  - name: result merges into the original, not replacing it
+    input_batch:
+      - content: '{"id":"7","keep":"me"}'
+    output_batches:
+      - - json_equals: { "id": "7", "keep": "me", "enriched": "value-7" }
+
+  - name: a deleted request_map skips the message untouched
+    target_processors: /processor_resources/0
+    input_batch:
+      - content: '{"id":"1","skip":false}'
+      - content: '{"id":"2","skip":true}'
+    output_batches:
+      - - json_equals: { "id": "1", "skip": false, "seen": true }
+        - json_equals: { "id": "2", "skip": true }
+
+processor_resources:
+  - label: cond
+    branch:
+      request_map: 'root = if this.skip { deleted() } else { this }'
+      processors:
+        - mapping: 'root = this'
+      result_map: 'root.seen = true'

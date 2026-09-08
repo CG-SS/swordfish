@@ -1,0 +1,101 @@
+// Suppressions for cppcheck. Each entry states WHY, so a future reader can tell
+// a deliberate exemption from an unreviewed one.
+
+// Vendored third-party code: not ours to fix, and the noise would bury our own
+// findings.
+*:third_party/*
+
+// cppcheck cannot see that Catch2's TEST_CASE registers and calls these.
+unusedFunction:tests/*
+
+// Public API surface. Much of it is called only from generated code or from a
+// consumer that cppcheck is not given, so "unused" here is not evidence.
+unusedFunction:include/*
+
+// cppcheck 2.21 does not model C++20 coroutines: it sees a function whose body
+// ends in co_await/co_return as falling off the end without a return. Verified
+// by hand that every instance is a coroutine.
+missingReturn
+
+// `duration` converts implicitly from std::chrono types on purpose, so a config
+// struct can be written `cfg::duration fetch_max_wait = 500ms`. Making the
+// constructors explicit would defeat that.
+noExplicitConstructor:include/swordfish/config/spec.hh
+
+// Style preference, considered and declined. Several of these loops carry side
+// effects, early exits, or index arithmetic that an algorithm would obscure
+// rather than clarify; rewriting them mechanically would trade readability for
+// a rule.
+useStlAlgorithm
+
+// spec_of tables reference members through pointer-to-member, which cppcheck
+// does not follow, so it reports every declaratively-used field as unused.
+unusedStructMember:src/components/processor_defs.cc
+
+# src/kafka/generated/protocol.cc is generated from the official Kafka schemas
+# by tools/gen_kafka_protocol.py. A nested struct repeats the version guard its
+# parent already established -- `version >= 4` inside a field that only exists
+# at v4+ -- which is redundant in context but correct in isolation, and the
+# generator would have to reason across nesting levels to elide it. That is
+# complexity in the generator to remove a style warning from code no one reads.
+knownConditionTrueFalse:src/kafka/generated/messages.cc
+
+// Zigzag encoding shifts a negative int32/int64 right to broadcast its sign
+// bit. C++20 made signed integers two's complement and defined `>>` on a
+// negative value as flooring division (P0907), so this is well-defined for the
+// standard this project pins; cppcheck is still applying the C++17 rule.
+shiftNegativeLHS:include/swordfish/kafka/wire.hh
+shiftTooManyBitsSigned:include/swordfish/kafka/wire.hh
+
+// std::mt19937_64::operator() is non-const -- it advances the generator -- so
+// the reference cannot be const. cppcheck does not model the standard library's
+// engines and reports it anyway.
+constVariableReference:src/functions.cc
+
+// cppcheck does not treat `co_return` as leaving the function, so every branch
+// AFTER an early `co_return std::move(rep)` looks like an access of a
+// moved-from variable. Checked by hand: the paths are mutually exclusive, and
+// the reply is moved exactly once on each.
+accessMoved:src/components/http.cc
+
+// A websocket output returns 1 from max_in_flight() deliberately. It happens to
+// equal the base class default today, which is what cppcheck objects to, but
+// "frames on one websocket are ordered, so two concurrent sends would interleave
+// two messages" is a property of that component and must not silently follow a
+// change to that default.
+//
+// outputs.cc is NOT suppressed any more: its composites used to return a flat 1
+// and now compute the maximum their children need, which starved a nested
+// `batching` policy for as long as the flat version stood.
+uselessOverride:src/components/http.cc
+
+// Every remaining shadowFunction report is a local named after the Bloblang
+// method its enclosing function implements -- `merge`, `sum`, `any`, `with`,
+// `keys`, `quote`, `escape_html`. Renaming them would make the code describe
+// the method less clearly in exchange for a rule about a name collision that
+// no reader can be confused by.
+shadowFunction:src/methods.cc
+shadowFunction:src/methods_crypto.cc
+shadowFunction:src/methods_parse.cc
+shadowFunction:src/methods_string.cc
+shadowFunction:src/methods_structured.cc
+
+// Both of these are the same coroutine blind spot as `missingReturn` above, and
+// both were checked by hand before being listed here.
+//
+// accessMoved: every `error_reply(std::move(rep), ...)` in the streams API is
+// immediately `co_return`ed, so control never reaches a second one -- but
+// cppcheck does not treat co_return as ending the path and reports the next
+// std::move as a use-after-move.
+//
+// derefInvalidIteratorRedundantCheck: `const auto rs = it->second;` sits
+// directly after its `it == end()` check with nothing between. cppcheck flagged
+// the EARLIER version of this code correctly, when the dereference really did
+// follow a co_await and a concurrent DELETE could invalidate the iterator; that
+// was a genuine use-after-free and is fixed (the table holds lw_shared_ptr and
+// every loop runs over a snapshot). What is left is the false positive.
+// Scoped to this file so the checks stay live everywhere else -- they have
+// already earned their keep here once.
+accessMoved:src/cli/streams_main.cc
+derefInvalidIteratorRedundantCheck:src/cli/streams_main.cc
+

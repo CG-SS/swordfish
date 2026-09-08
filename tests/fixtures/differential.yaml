@@ -1,0 +1,756 @@
+# Hand-written differential corpus: interpreter vs. compiled, compared against
+# each other rather than against a recorded answer.
+#
+# tests/fixtures/bloblang.yaml covers what the reference documents. This file
+# covers what it does NOT: the traps that only
+# show up on specific values -- Bloblang's four-pass precedence, the numeric
+# degradation ladder, the boundaries where the emitter's guard-and-specialise
+# fast path falls back to the generic one, and the values (`nothing`, `deleted`,
+# null) that have no literal syntax in most examples.
+#
+# Every entry runs each input through both backends. A mapping that errors is
+# fine, as long as both backends error.
+
+# ---- precedence -------------------------------------------------------------
+# All six comparisons share one level, and && and || share another. Both differ
+# from C++, so any expression the emitter renders with C++ operators rather than
+# with explicit parentheses diverges here.
+- id: 'prec.mul_before_add'
+  mapping: 'root = this.a + this.b * this.c - this.d / this.e'
+  inputs: ['{"a":1,"b":2,"c":3,"d":8,"e":4}', '{"a":-5,"b":0,"c":9,"d":1,"e":3}']
+- id: 'prec.comparisons_share_a_level'
+  mapping: 'root = this.a < this.b == this.c < this.d'
+  inputs: ['{"a":1,"b":2,"c":3,"d":4}', '{"a":2,"b":1,"c":3,"d":4}']
+- id: 'prec.and_or_share_a_level'
+  mapping: 'root = this.a || this.b && this.c'
+  inputs: ['{"a":false,"b":true,"c":false}', '{"a":true,"b":false,"c":false}']
+- id: 'prec.coalesce_binds_tightest'
+  mapping: 'root = this.a | this.b + this.c'
+  inputs: ['{"b":1,"c":2}', '{"a":10,"b":1,"c":2}', '{"a":null,"b":1,"c":2}']
+- id: 'prec.unary_minus'
+  mapping: 'root = -this.a * this.b'
+  inputs: ['{"a":3,"b":4}', '{"a":-3,"b":4}']
+- id: 'prec.mixed_chain'
+  mapping: 'root = this.a % this.b + this.c * this.d < this.e || this.f'
+  inputs: ['{"a":7,"b":3,"c":2,"d":5,"e":20,"f":false}']
+
+# ---- numeric degradation ----------------------------------------------------
+# Integers stay integers until an operand forces float, and overflow wraps the
+# way Go's int64 does rather than being undefined.
+- id: 'num.int_stays_int'
+  mapping: 'root = this.a + this.b'
+  inputs: ['{"a":1,"b":2}', '{"a":9007199254740993,"b":1}']
+- id: 'num.float_contaminates'
+  mapping: 'root = this.a + this.b'
+  inputs: ['{"a":1,"b":2.0}', '{"a":1.5,"b":2}']
+- id: 'num.division_is_always_float'
+  mapping: 'root = this.a / this.b'
+  inputs: ['{"a":6,"b":3}', '{"a":7,"b":2}', '{"a":1,"b":0}']
+- id: 'num.modulo_edges'
+  mapping: 'root = this.a % this.b'
+  inputs: ['{"a":7,"b":3}', '{"a":-7,"b":3}', '{"a":7,"b":-3}', '{"a":1,"b":0}',
+           '{"a":-9223372036854775808,"b":-1}']
+- id: 'num.overflow_wraps'
+  mapping: 'root = this.a * this.b'
+  inputs: ['{"a":9223372036854775807,"b":2}', '{"a":-9223372036854775808,"b":-1}']
+- id: 'num.negate_min'
+  mapping: 'root = -this.a'
+  inputs: ['{"a":-9223372036854775808}', '{"a":0}', '{"a":1.5}']
+- id: 'num.abs_min'
+  mapping: 'root = this.a.abs()'
+  inputs: ['{"a":-9223372036854775808}', '{"a":-1}', '{"a":-1.5}']
+- id: 'num.compare_across_types'
+  mapping: 'root = [this.a < this.b, this.a == this.b, this.a >= this.b]'
+  inputs: ['{"a":1,"b":1.0}', '{"a":2,"b":1.9999999999999999}']
+
+# ---- absent, null, nothing, deleted -----------------------------------------
+- id: 'absent.field_errors'
+  mapping: 'root = this.missing'
+  inputs: ['{}', '{"missing":null}']
+- id: 'absent.coalesce_recovers'
+  mapping: 'root = this.missing | "fallback"'
+  inputs: ['{}', '{"missing":null}', '{"missing":false}', '{"missing":0}']
+- id: 'absent.deleted_removes'
+  mapping: |-
+    root = this
+    root.a = deleted()
+  inputs: ['{"a":1,"b":2}', '{"b":2}']
+- id: 'absent.root_deleted_filters'
+  mapping: 'root = deleted()'
+  inputs: ['{"a":1}']
+- id: 'absent.nothing_leaves_content'
+  mapping: 'root = if this.a > 0 { this.a }'
+  inputs: ['{"a":1}', '{"a":-1}']
+- id: 'absent.exists'
+  mapping: 'root = [this.exists("a"), this.exists("a.b"), this.exists("z")]'
+  inputs: ['{"a":{"b":1}}', '{"a":1}', '{}']
+
+# ---- the string root rule ---------------------------------------------------
+# A string root becomes the message content verbatim; anything else is encoded.
+- id: 'root.string_is_verbatim'
+  mapping: 'root = this.a'
+  inputs: ['{"a":"plain text"}', '{"a":"has \"quotes\" and \\ backslash"}',
+           '{"a":123}', '{"a":null}', '{"a":[1,2]}']
+- id: 'root.string_method'
+  mapping: 'root = this.a.uppercase()'
+  inputs: ['{"a":"mixed Case"}']
+
+# ---- strings ----------------------------------------------------------------
+- id: 'str.length_counts_bytes'
+  mapping: 'root = [this.a.length(), this.a.uppercase(), this.a.reverse()]'
+  inputs: ['{"a":"abc"}', '{"a":""}', '{"a":"héllo"}', '{"a":"日本語"}']
+- id: 'str.slice_bounds'
+  mapping: 'root = this.a.slice(this.lo, this.hi)'
+  inputs: ['{"a":"abcdef","lo":1,"hi":3}', '{"a":"abcdef","lo":0,"hi":0}',
+           '{"a":"abcdef","lo":-3,"hi":6}', '{"a":[1,2,3],"lo":1,"hi":3}']
+- id: 'str.split_join_roundtrip'
+  mapping: 'root = this.a.split(",").join("|")'
+  inputs: ['{"a":"x,y,z"}', '{"a":""}', '{"a":"single"}', '{"a":",,"}']
+- id: 'str.replace_all'
+  mapping: 'root = this.a.replace_all(this.o, this.n)'
+  inputs: ['{"a":"aaa","o":"a","n":"b"}', '{"a":"aaa","o":"","n":"-"}',
+           '{"a":"abc","o":"z","n":"y"}']
+- id: 'str.trim_variants'
+  mapping: 'root = [this.a.trim(), this.a.trim("xy"), this.a.trim_prefix("x"), this.a.trim_suffix("y")]'
+  inputs: ['{"a":"  pad  "}', '{"a":"xyzzyx"}', '{"a":""}']
+- id: 'str.index_and_contains'
+  mapping: 'root = [this.a.index_of("b"), this.a.contains("b"), this.a.has_prefix("a"), this.a.has_suffix("c")]'
+  inputs: ['{"a":"abc"}', '{"a":"xyz"}']
+- id: 'str.quote_and_format'
+  mapping: 'root = this.a.quote()'
+  inputs: ['{"a":"tab\there"}', '{"a":"nl\nhere"}', '{"a":"\"already\""}']
+
+# ---- encodings --------------------------------------------------------------
+- id: 'enc.roundtrip'
+  mapping: 'root = this.a.encode(this.s).decode(this.s)'
+  inputs: ['{"a":"hello","s":"base64"}', '{"a":"hello","s":"base64url"}',
+           '{"a":"hello","s":"base64rawurl"}', '{"a":"hello","s":"hex"}',
+           '{"a":"hello","s":"ascii85"}', '{"a":"","s":"ascii85"}',
+           '{"a":"eightchr","s":"z85"}']
+- id: 'enc.misaligned_z85_errors'
+  mapping: 'root = this.a.encode("z85")'
+  inputs: ['{"a":"seven c"}', '{"a":""}']
+- id: 'enc.bad_scheme'
+  mapping: 'root = this.a.encode("rot13")'
+  inputs: ['{"a":"hello"}']
+
+# ---- structured -------------------------------------------------------------
+- id: 'struct.merge_conflicts_make_arrays'
+  mapping: 'root = this.a.merge(this.b)'
+  inputs: ['{"a":{"k":1},"b":{"k":2}}', '{"a":{"k":[1]},"b":{"k":2}}',
+           '{"a":{"k":1},"b":{"j":2}}', '{"a":[1],"b":[2]}']
+- id: 'struct.sort_unique_flatten'
+  mapping: 'root = this.a.flatten().unique().sort()'
+  inputs: ['{"a":[[3,1],[2,1]]}', '{"a":[]}', '{"a":[["b","a"],["a"]]}']
+- id: 'struct.keys_values'
+  mapping: 'root = [this.a.keys(), this.a.values()]'
+  inputs: ['{"a":{"b":1,"a":2}}', '{"a":{}}']
+- id: 'struct.sum_min_max'
+  mapping: 'root = [this.a.sum(), this.a.min(), this.a.max()]'
+  inputs: ['{"a":[1,2,3]}', '{"a":[1.5,2]}', '{"a":[]}']
+- id: 'struct.get_path'
+  mapping: 'root = this.get("a.b.c")'
+  inputs: ['{"a":{"b":{"c":1}}}', '{"a":{"b":{}}}', '{"a":1}']
+- id: 'struct.index'
+  mapping: 'root = this.a.index(this.i)'
+  inputs: ['{"a":[1,2,3],"i":0}', '{"a":[1,2,3],"i":-1}', '{"a":[1,2,3],"i":5}']
+
+# ---- lambdas and bare queries ----------------------------------------------
+# Both argument forms, nested, and with the parameter shadowing a variable.
+- id: 'lambda.map_each_named'
+  mapping: 'root = this.a.map_each(x -> x * 2)'
+  inputs: ['{"a":[1,2,3]}', '{"a":[]}', '{"a":{"k":1}}']
+- id: 'lambda.map_each_bare_query'
+  mapping: 'root = this.a.map_each(this.string())'
+  inputs: ['{"a":[1,2,3]}', '{"a":["x"]}']
+- id: 'lambda.filter_both_forms'
+  mapping: 'root = [this.a.filter(x -> x > 1), this.a.filter(this > 1)]'
+  inputs: ['{"a":[1,2,3]}', '{"a":[]}']
+- id: 'lambda.nested_scopes'
+  mapping: 'root = this.a.map_each(x -> x.map_each(y -> y + 1))'
+  inputs: ['{"a":[[1,2],[3]]}']
+- id: 'lambda.shadowing_restores'
+  mapping: |-
+    let x = 99
+    root.a = this.n.map_each(x -> x * 2)
+    root.b = $x
+  inputs: ['{"n":[1,2]}']
+- id: 'lambda.mixed_forms_nest'
+  mapping: 'root = this.a.map_each(x -> x.map_each(this + 1))'
+  inputs: ['{"a":[[1,2]]}']
+
+# ---- regex ------------------------------------------------------------------
+# A literal pattern is compiled once at build time; a computed one goes through
+# the runtime cache. Both must behave the same.
+- id: 're.literal_pattern'
+  mapping: 'root = [this.a.re_match("^[a-z]+$"), this.a.re_replace_all("[0-9]", "#")]'
+  inputs: ['{"a":"abc"}', '{"a":"a1b2"}', '{"a":""}']
+- id: 're.computed_pattern'
+  mapping: 'root = this.a.re_replace_all(this.p, "#")'
+  inputs: ['{"a":"a1b2","p":"[0-9]"}', '{"a":"a1b2","p":"("}']
+- id: 're.find_all'
+  mapping: 'root = [this.a.re_find_all("[a-z]+"), this.a.re_find_all_submatch("([a-z])([0-9])")]'
+  inputs: ['{"a":"ab12cd"}', '{"a":"12"}']
+
+# ---- control flow -----------------------------------------------------------
+- id: 'flow.if_else_chain'
+  mapping: 'root = if this.n > 10 { "big" } else if this.n > 0 { "small" } else { "none" }'
+  inputs: ['{"n":11}', '{"n":1}', '{"n":0}', '{"n":-1}']
+- id: 'flow.if_without_else_is_nothing'
+  mapping: |-
+    root.a = 1
+    root.b = if this.n > 0 { this.n }
+  inputs: ['{"n":1}', '{"n":-1}']
+- id: 'flow.variables_and_counters'
+  mapping: |-
+    let a = this.n * 2
+    let b = $a + 1
+    root = [$a, $b]
+  inputs: ['{"n":3}', '{"n":0}']
+
+# ---- metadata ---------------------------------------------------------------
+# meta() reads the INPUT message's metadata and `meta x = ...` writes the
+# output's, so within one mapping a write is never visible to a later read --
+# root_meta() is the accessor that sees it. Verified against
+# redpanda-connect 4.107.2; Swordfish returned the written value for both until
+# the read source and write target were separated.
+- id: 'meta.set_and_read'
+  mapping: |-
+    meta k = this.a
+    root.v = meta("k")
+  inputs: ['{"a":"x"}', '{"a":1}']
+- id: 'meta.write_then_root_meta'
+  mapping: |-
+    meta k = this.a
+    root.written = root_meta("k")
+    root.read_in  = meta("k")
+  inputs: ['{"a":"x"}', '{"a":1}']
+- id: 'meta.delete'
+  mapping: |-
+    meta k = "x"
+    meta k = deleted()
+    root.v = meta("k")
+  inputs: ['{}']
+# No key means every entry as an object. The interpreter used to throw here and
+# the emitter used to look up the empty string, so the two backends disagreed
+# and nothing exercised it.
+- id: 'meta.no_key_is_all'
+  mapping: |-
+    meta a = "one"
+    meta b = "two"
+    root.all = meta()
+    root.root_all = root_meta()
+  inputs: ['{}']
+- id: 'meta.empty_key_is_all'
+  mapping: 'root.all = meta("")'
+  inputs: ['{}']
+
+# ---- literals ---------------------------------------------------------------
+# Float literals that happen to be integral must still emit as floats, or the
+# compiled path silently switches to integer arithmetic.
+- id: 'lit.integral_float'
+  # No exponent literal here: Bloblang has none. `1e3` used to be half-accepted
+  # by the scanner and is a named parse error now, matching the reference, which
+  # refuses it too. 1000.0 is the same value written the way the grammar allows.
+  mapping: 'root = [1.0, 2.0 + 1, 3.0 / 2, -0.0, 1000.0]'
+  inputs: ['{}']
+# JSON float ENCODING, which is not %g and is not strconv.FormatFloat('g').
+# encoding/json formats with 'f' unless |v| < 1e-6 or |v| >= 1e21, and then
+# strips the leading zero from a two-digit negative exponent. Every value here
+# sits on or across one of those cutoffs, and each one differed before the
+# encoder was rewritten: 1e20 printed as 1e+20 against 100000000000000000000,
+# 1e-6 as 1e-06 against 0.000001, 1e-7 as 1e-07 against 1e-7.
+#
+# These are only meaningful against the REFERENCE (the L4 gate), because both
+# swordfish backends share one encoder and would agree with each other however
+# wrong it was. They are byte-compared: the L4 harness used to fall back to
+# json.loads(), which made 1e+20 and 100000000000000000000 equal and is exactly
+# why 425 passing cases said nothing about any of this.
+- id: 'lit.float_encoding.cutoffs'
+  mapping: |
+    root.a = this.v + 0.0
+  inputs:
+    - '{"v":1e20}'
+    - '{"v":1e21}'
+    - '{"v":1e-6}'
+    - '{"v":1e-7}'
+    - '{"v":1e-9}'
+    - '{"v":1e-300}'
+    - '{"v":123456789012345678.0}'
+    - '{"v":-2.5e-8}'
+    - '{"v":0.00012345}'
+    - '{"v":0}'
+- id: 'lit.float_encoding.arithmetic'
+  mapping: |
+    root.third = 1.0 / 3.0
+    root.big = 1000000.0 * 1000000.0 * 1000000.0 * 1000000.0
+    root.small = 1.0 / 1000000.0
+    root.smaller = 1.0 / 10000000.0
+    root.neg = 0.0 - 0.0
+  inputs: ['{}']
+# The `@` metadata shorthand, which was not implemented at all -- `@foo`,
+# `@"X-Foo"` and a bare `@` each failed with `unexpected character`. It becomes a
+# `meta` call in the parser, so both backends get it from one place, and this
+# case exists to keep them agreeing about that.
+#
+# Only the forms that need no message metadata go here: the L4 gate skips
+# anything containing `meta`, because the reference's `blobl` CLI has no metadata
+# and hangs on it. The interpreted-vs-compiled half is what this file checks, and
+# the reference comparison lives in tests/test_http_check.sh's metadata cases.
+- id: 'meta.shorthand_parses'
+  mapping: |
+    root.a = (@nope | "absent")
+    root.b = (@"no-such-key" | "absent")
+  inputs: ['{}']
+- id: 'lit.escapes'
+  mapping: 'root = ["a\"b", "c\\d", "e\nf", "g\th"]'
+  inputs: ['{}']
+- id: 'lit.raw_string'
+  mapping: 'root = """a\w b"""'
+  inputs: ['{}']
+- id: 'lit.object_and_array'
+  mapping: 'root = {"k": [1, {"n": null}], "z": true}'
+  inputs: ['{}']
+
+# ---- coercion ---------------------------------------------------------------
+- id: 'coerce.number'
+  mapping: 'root = this.a.number()'
+  inputs: ['{"a":"1"}', '{"a":"1.5"}', '{"a":"nope"}', '{"a":true}', '{"a":""}']
+# The fallback covers a target that fails to RESOLVE as well as one that fails
+# to coerce, so `this.missing.number(5)` must yield 5 rather than erroring.
+- id: 'coerce.number_default'
+  mapping: 'root = [this.a.number(5), this.missing.number(5), this.a.number()]'
+  inputs: ['{"a":1}', '{"a":"2"}']
+- id: 'coerce.number_default_absent_target'
+  mapping: 'root = this.missing.number(5)'
+  inputs: ['{}', '{"missing":"nope"}', '{"missing":"3"}']
+- id: 'coerce.bool_default'
+  mapping: 'root = [this.a.bool(true), this.missing.bool(false)]'
+  inputs: ['{"a":"nope"}', '{"a":1}', '{"a":"true"}']
+- id: 'coerce.string_and_bool'
+  mapping: 'root = [this.a.string(), this.a.type()]'
+  inputs: ['{"a":1}', '{"a":1.5}', '{"a":true}', '{"a":null}', '{"a":[1]}', '{"a":{"k":1}}']
+- id: 'coerce.parse_and_format_json'
+  mapping: 'root = this.a.parse_json().format_json(no_indent: true)'
+  inputs: ['{"a":"{\"b\":1}"}', '{"a":"not json"}']
+- id: 'coerce.format_json_options'
+  mapping: 'root = [this.a.format_json(), this.a.format_json("  "), this.a.format_json(escape_html: false)]'
+  inputs: ['{"a":{"h":"a&b<c>d"}}', '{"a":[]}', '{"a":1}']
+
+# ---- bytes ------------------------------------------------------------------
+# A []byte is a string with a different type tag: it compares and concatenates
+# like one, but reports "bytes" and base64-encodes when serialised into JSON.
+- id: 'bytes.type_and_json'
+  mapping: 'root = {"t": content().type(), "nested": [content()], "s": content().string()}'
+  inputs: ['{"a":1}', '{"a":"x"}']
+- id: 'bytes.root_is_verbatim'
+  mapping: 'root = content()'
+  inputs: ['{"a":1}', 'not json at all']
+- id: 'bytes.compares_like_a_string'
+  mapping: 'root = [this.a.bytes() == this.a, this.a.bytes() < "zzz", this.a.bytes() + "!"]'
+  inputs: ['{"a":"abc"}', '{"a":""}']
+- id: 'bytes.string_methods_accept_it'
+  mapping: 'root = [this.a.bytes().uppercase(), this.a.bytes().length(), this.a.bytes().reverse()]'
+  inputs: ['{"a":"abc"}']
+- id: 'bytes.index_yields_a_number'
+  mapping: 'root = [this.a.bytes().index(0), this.a.bytes().index(-1)]'
+  inputs: ['{"a":"foobar"}', '{"a":"z"}']
+- id: 'bytes.decode_yields_bytes'
+  mapping: 'root = [this.a.decode("hex").type(), this.a.decode("hex").string()]'
+  inputs: ['{"a":"616263"}']
+- id: 'bytes.of_non_string'
+  mapping: 'root = [this.a.bytes().type(), this.a.bytes().string()]'
+  inputs: ['{"a":1}', '{"a":[1,2]}', '{"a":{"k":1}}', '{"a":null}']
+
+# ---- message functions ------------------------------------------------------
+- id: 'fn.json_reaches_the_root'
+  mapping: |-
+    root.a = json("foo.bar")
+    root.b = json()
+    root.c = this.foo.map_each(x -> json("foo.bar"))
+  inputs: ['{"foo":{"bar":"hello"}}']
+- id: 'fn.json_missing_path'
+  mapping: 'root = json("nope.deeper")'
+  inputs: ['{"foo":1}']
+- id: 'fn.error_and_errored'
+  mapping: 'root = {"e": error(), "b": errored()}'
+  inputs: ['{}']
+- id: 'fn.batch_position'
+  mapping: 'root = [batch_index(), batch_size()]'
+  inputs: ['{}']
+
+# ---- pure functions ---------------------------------------------------------
+- id: 'fn.range_shapes'
+  mapping: 'root = [range(0, 10), range(0, 10, 3), range(0, -10, -2), range(0, 250, 100)]'
+  inputs: ['{}']
+- id: 'fn.range_rejects_empty'
+  mapping: 'root = range(this.a, this.b, this.c)'
+  inputs: ['{"a":0,"b":0,"c":1}', '{"a":5,"b":0,"c":1}', '{"a":0,"b":5,"c":-1}',
+           '{"a":0,"b":5,"c":0}', '{"a":0,"b":7,"c":3}']
+- id: 'fn.throw_fails_the_mapping'
+  mapping: 'root = if this.ok { this } else { throw("nope") }'
+  inputs: ['{"ok":true}', '{"ok":false}']
+- id: 'fn.deleted_and_nothing'
+  mapping: |-
+    root = this
+    root.a = deleted()
+    root.b = nothing()
+  inputs: ['{"a":1,"b":2,"c":3}']
+- id: 'fn.env_missing_is_null'
+  mapping: 'root = env("SWORDFISH_DEFINITELY_NOT_SET_12345")'
+  inputs: ['{}']
+
+# ---- statement forms added with the wider catalogue -------------------------
+# `match`, `map`/`apply` and `catch` are the four constructs both backends
+# implement by hand rather than through the method table, so they are the ones
+# that can drift. Everything table-driven is covered by construction.
+- id: 'stmt.match_no_context'
+  mapping: |-
+    root = match {
+      this.n > 10 => "big"
+      this.n > 5  => "medium"
+      _           => "small"
+    }
+  inputs: ['{"n":20}', '{"n":7}', '{"n":1}']
+- id: 'stmt.match_with_context'
+  mapping: |-
+    root = match this.n {
+      this > 10 => this * 2
+      this > 5  => this
+      _         => 0
+    }
+  inputs: ['{"n":20}', '{"n":7}', '{"n":1}']
+- id: 'stmt.match_falls_through_to_nothing'
+  mapping: |-
+    root = this
+    root.tag = match { this.n > 100 => "huge" }
+  inputs: ['{"n":1}', '{"n":200}']
+- id: 'stmt.match_non_boolean_case_does_not_match'
+  mapping: 'root = match { this.n => "yes", _ => "no" }'
+  inputs: ['{"n":true}', '{"n":false}', '{"n":1}']
+- id: 'stmt.map_apply'
+  mapping: |-
+    map wrap {
+      root.inner = this
+      root.kind = this.type()
+    }
+    
+    root.a = this.x.apply("wrap")
+    root.b = this.y.apply("wrap")
+  inputs: ['{"x":1,"y":"two"}', '{"x":null,"y":[1,2]}']
+- id: 'stmt.map_isolates_variables'
+  mapping: |-
+    map inner {
+      let v = "inner"
+      root = $v
+    }
+    
+    let v = "outer"
+    root.from_map = this.apply("inner")
+    root.outer = $v
+  inputs: ['{}']
+- id: 'stmt.catch_binds_the_error'
+  mapping: |-
+    root.a = this.missing.uppercase().catch(err -> {"failed":err.type()})
+    root.b = this.missing.uppercase().catch("fallback")
+    root.c = this.present.uppercase().catch("unused")
+  inputs: ['{"present":"ok"}']
+- id: 'stmt.catch_on_unstructured_input'
+  mapping: 'root = this.catch(deleted())'
+  inputs: ['{"a":1}']
+
+# ---- object literals with computed keys -------------------------------------
+- id: 'obj.computed_key'
+  mapping: 'root = this.items.map_each(i -> {i.k: i.v})'
+  inputs: ['{"items":[{"k":"a","v":1},{"k":"b","v":2}]}']
+- id: 'obj.computed_key_must_be_a_string'
+  mapping: 'root = {this.k: 1}'
+  inputs: ['{"k":"ok"}', '{"k":5}']
+- id: 'obj.trailing_commas'
+  mapping: 'root = {"a": 1, "b": [1, 2, 3,],}'
+  inputs: ['{}']
+
+# ---- the lambda-taking methods ----------------------------------------------
+- id: 'lam.all_any'
+  mapping: |-
+    root.all = this.xs.all(x -> x > 0)
+    root.any = this.xs.any(x -> x > 2)
+  inputs: ['{"xs":[1,2,3]}', '{"xs":[]}', '{"xs":[-1,2]}']
+- id: 'lam.fold'
+  mapping: |-
+    root.sum = this.xs.fold(0, i -> i.tally + i.value)
+    root.cat = this.xs.fold("", i -> "%v%v".format(i.tally, i.value))
+  inputs: ['{"xs":[1,2,3]}', '{"xs":[]}']
+- id: 'lam.sort_and_sort_by'
+  mapping: |-
+    root.by = this.xs.sort_by(e -> e.k)
+    root.cmp = this.xs.sort(p -> p.left.k > p.right.k)
+    root.plain = this.ys.sort()
+  inputs: ['{"xs":[{"k":3},{"k":1},{"k":2}],"ys":[3,1,2]}']
+- id: 'lam.unique_with_and_without_a_query'
+  mapping: |-
+    root.plain = this.xs.unique()
+    root.byid = this.ys.unique(y -> y.id)
+  inputs: ['{"xs":[1,2,1,3],"ys":[{"id":1},{"id":2},{"id":1}]}']
+- id: 'lam.find_by'
+  mapping: |-
+    root.first = this.xs.find_by(x -> x > 1)
+    root.every = this.xs.find_all_by(x -> x > 1)
+  inputs: ['{"xs":[0,2,1,3]}', '{"xs":[0]}']
+- id: 'lam.map_each_key'
+  mapping: 'root = this.map_each_key(k -> if k.has_prefix("a") { "_" + k })'
+  inputs: ['{"aa":1,"bb":2}']
+- id: 'lam.bare_query_form'
+  mapping: 'root = this.xs.map_each(this.string())'
+  inputs: ['{"xs":[1,2,3]}']
+
+# ---- the regex methods that return objects ----------------------------------
+- id: 're.find_object'
+  mapping: |-
+    root.one = this.v.re_find_object("a(?P<foo>x*)b")
+    root.many = this.v.re_find_all_object("a(?P<foo>x*)b")
+    root.repl = this.v.re_replace("x+", "-")
+  inputs: ['{"v":"-axxb-ab-"}', '{"v":"nothing here"}']
+
+# ---- the wider value model --------------------------------------------------
+# float32, timestamps and raw numbers are all new representations; each has to
+# survive being emitted as a literal and printed the same way in both backends.
+- id: 'val.float32_precision'
+  mapping: |-
+    root.f = this.s.float32()
+    root.d = this.s.float64()
+  inputs: ['{"s":"6.674282313423543523453425345e-11"}', '{"s":"1"}']
+- id: 'val.timestamps_round_trip'
+  mapping: |-
+    root.parsed = this.t.ts_parse("2006-01-02T15:04:05Z07:00")
+    root.unix = this.t.ts_unix()
+    root.tz = this.t.ts_tz("America/New_York")
+    root.fmt = this.t.ts_format("2006-Jan-02 15:04:05", "UTC")
+    root.strf = this.t.ts_strftime("%Y-%m-%dT%H:%M:%S", "UTC")
+  inputs: ['{"t":"2021-02-03T16:05:06Z"}', '{"t":"2021-02-03T17:05:06+01:00"}']
+- id: 'val.timestamp_arithmetic'
+  mapping: |-
+    root.add = this.t.ts_add_iso8601("P1Y2M3DT4H5M6S")
+    root.sub = this.t.ts_sub_iso8601("P1M")
+    root.round = this.t.ts_round("1h".parse_duration())
+    root.diff = this.t.ts_sub("2020-01-01T00:00:00Z")
+  inputs: ['{"t":"2020-08-14T05:54:23Z"}']
+- id: 'val.raw_numbers'
+  mapping: |-
+    root.plain = this.s.parse_json()
+    root.raw = this.s.parse_json(use_number: true)
+  inputs: ['{"s":"{\"n\":1.5,\"big\":11380878173205700000000000000000000000000000000}"}']
+- id: 'val.integer_widths'
+  mapping: |-
+    root.a = this.n.int8().catch("out of range")
+    root.b = this.n.uint8().catch("out of range")
+    root.c = this.n.int64()
+  inputs: ['{"n":12}', '{"n":-12}', '{"n":300}', '{"n":"0xD"}']
+
+# ---- object and array reshaping ---------------------------------------------
+- id: 'shape.collapse_explode'
+  mapping: |-
+    root.flat = this.collapse()
+    root.flat_all = this.collapse(include_empty: true)
+  inputs: ['{"foo":[{"bar":"1"},{"bar":{}},{"bar":"2"},{"bar":[]}]}']
+- id: 'shape.with_without'
+  mapping: |-
+    root.kept = this.with("inner.a", "d")
+    root.dropped = this.without("inner.a", "d")
+  inputs: ['{"inner":{"a":1,"b":2},"d":3,"e":4}']
+- id: 'shape.zip_concat_squash'
+  mapping: |-
+    root.z = this.a.zip(this.b)
+    root.c = this.a.concat(this.b)
+    root.s = this.a.map_each(x -> {"k": [x]}).squash()
+  inputs: ['{"a":[1,2],"b":[3,4]}']
+- id: 'shape.diff_then_patch'
+  mapping: |-
+    let d = this.before.diff(this.after)
+    root.changes = $d
+    root.rebuilt = this.before.patch($d)
+  inputs: ['{"before":{"name":"Alice","age":30},"after":{"name":"Alice","age":31,"city":"NYC"}}']
+- id: 'shape.explode'
+  mapping: 'root = this.explode("value")'
+  inputs: ['{"id":1,"value":["foo","bar"]}', '{"id":1,"value":{"a":2,"b":3}}']
+
+# ---- other formats ----------------------------------------------------------
+- id: 'fmt.csv_and_logfmt'
+  mapping: |-
+    root.csv = this.c.parse_csv()
+    root.rows = this.c.parse_csv(false)
+    root.log = this.l.parse_logfmt()
+  inputs: ['{"c":"a,b\nx,y","l":"level=info msg=\"hello world\" flag"}']
+- id: 'fmt.url_and_form'
+  mapping: |-
+    root.u = this.u.parse_url()
+    root.f = this.f.parse_form_url_encoded()
+  inputs: ['{"u":"https://user:pw@example.com/a%20b?q=1#frag","f":"a=1&b=2&b=3"}']
+- id: 'fmt.yaml_xml_msgpack'
+  mapping: |-
+    root.y = this.d.format_yaml().string()
+    root.x = this.d.format_xml().string()
+    root.m = this.d.format_msgpack().encode("hex")
+    root.back = this.d.format_msgpack().parse_msgpack()
+  inputs: ['{"d":{"foo":{"bar":"baz"}}}']
+- id: 'fmt.jsonpath'
+  mapping: 'root.names = this.json_path("$..name")'
+  inputs: ['{"name":"alice","foo":{"name":"bob"}}']
+
+# ---- crypto -----------------------------------------------------------------
+- id: 'crypto.hashes'
+  mapping: |-
+    root.sha1 = this.v.hash("sha1").encode("hex")
+    root.hmac = this.v.hash("hmac_sha256", "key").encode("hex")
+    root.crc = this.v.hash(algorithm: "crc32", polynomial: "Castagnoli").encode("hex")
+    root.xx = this.v.hash("xxhash64").string()
+    root.fnv = this.v.hash("fnv32").string()
+    root.uuid = this.v.uuid_v5("dns")
+  inputs: ['{"v":"hello world"}']
+- id: 'crypto.aes_round_trip'
+  mapping: |-
+    let key = "2b7e151628aed2a6abf7158809cf4f3c".decode("hex")
+    let iv = "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff".decode("hex")
+    root.enc = this.v.encrypt_aes("ctr", $key, $iv).encode("hex")
+    root.dec = this.v.encrypt_aes("ctr", $key, $iv).decrypt_aes("ctr", $key, $iv).string()
+  inputs: ['{"v":"hello world!"}']
+- id: 'crypto.jwt_round_trip'
+  mapping: 'root.claims = this.c.sign_jwt_hs256("secret").parse_jwt_hs256("secret")'
+  inputs: ['{"c":{"sub":"1234","n":1}}']
+
+# ---- compression ------------------------------------------------------------
+- id: 'zip.round_trip'
+  mapping: |-
+    root.gzip = this.v.compress("gzip").decompress("gzip").string()
+    root.zstd = this.v.compress("zstd").decompress("zstd").string()
+    root.snappy = this.v.compress("snappy").decompress("snappy").string()
+  inputs: ['{"v":"the quick brown fox jumps over the lazy dog"}']
+
+# ---- dynamic mappings -------------------------------------------------------
+- id: 'dyn.bloblang'
+  mapping: 'root = this.body.bloblang(this.m)'
+  inputs: ['{"body":{"foo":"hello"},"m":"root.foo = this.foo.uppercase()"}']
+- id: 'dyn.bloblang_rejects_environment_access'
+  mapping: 'root = this.body.bloblang(this.m)'
+  inputs: ['{"body":{},"m":"root = env(\"PATH\")"}']
+
+# ---- schema validation ------------------------------------------------------
+- id: 'schema.json_schema'
+  mapping: 'root = this.doc.json_schema("{\"type\":\"object\",\"properties\":{\"foo\":{\"type\":\"string\"}},\"required\":[\"foo\"]}")'
+  inputs: ['{"doc":{"foo":"bar"}}', '{"doc":{"foo":5}}', '{"doc":{}}']
+
+# ---- bare-path assignment targets --------------------------------------------
+# `foo = 1` is shorthand for `root.foo = 1`. The parser rejected it outright
+# until the Benthos test corpus turned up four files that use it.
+- id: 'target.bare_path'
+  mapping: |-
+    foo = this.a
+    bar.baz = this.a + 1
+  inputs: ['{"a":1}', '{"a":"x"}']
+- id: 'target.bare_path_mixed_with_root'
+  mapping: |-
+    root.explicit = 1
+    implicit = 2
+  inputs: ['{}']
+- id: 'path.quoted_segment'
+  mapping: 'root = this.a."b.c"'
+  inputs: ['{"a":{"b.c":1}}', '{"a":{"b.c":"x"}}', '{"a":{}}']
+- id: 'path.quoted_segment_chained'
+  mapping: 'root = this."x y".z'
+  inputs: ['{"x y":{"z":2}}', '{}']
+# A bare identifier is a field of `this`. Unknown CALLS stay named errors --
+# `foo()` still fails to parse -- so this does not open a silent-approximation
+# hole; it is only the parenthesis-free spelling that reads a field.
+- id: 'ident.bare_is_this_field'
+  mapping: 'root = foo'
+  inputs: ['{"foo":1}', '{"foo":"x"}', '{}']
+- id: 'ident.bare_inside_map_each'
+  mapping: 'root = this.a.map_each(n)'
+  inputs: ['{"a":[{"n":1},{"n":2}]}', '{"a":[]}']
+- id: 'ident.bare_with_method'
+  mapping: 'root = foo.uppercase()'
+  inputs: ['{"foo":"ab"}']
+
+# ---- literals omit `nothing` and `deleted`, but keep an explicit null --------
+# `{"a": if false { 1 }}` is how a mapping conditionally sets a field, so the
+# entry has to vanish rather than become null. An explicit null must survive,
+# which is why the rule cannot just test for "no value".
+- id: 'literal.object_omits_nothing'
+  mapping: 'root = {"a":1, "b": if this.x > 0 { 2 }}'
+  inputs: ['{"x":0}', '{"x":5}']
+- id: 'literal.object_omits_deleted'
+  mapping: 'root = {"a":1, "b": if this.x > 0 { 2 } else { deleted() }}'
+  inputs: ['{"x":0}', '{"x":5}']
+- id: 'literal.array_omits_nothing_and_deleted'
+  mapping: 'root = [1, if this.x > 0 { 2 }, if this.x > 0 { 3 } else { deleted() }]'
+  inputs: ['{"x":0}', '{"x":5}']
+- id: 'literal.explicit_null_survives'
+  mapping: 'root = {"a":1, "b": null, "c": [1, null, 2]}'
+  inputs: ['{}']
+
+# ---- `.or()` is lazy on the TARGET too ---------------------------------------
+# A target that fails to resolve falls back. `this.or(content())` on a message
+# that is not JSON is the idiom this protects, and the interpreter used to throw
+# where the compiled path fell back -- a real divergence no fixture reached.
+- id: 'or.target_that_fails_falls_back'
+  mapping: 'root = this.missing.deeper.or("fallback")'
+  inputs: ['{}', '{"missing":{"deeper":"found"}}']
+- id: 'or.null_and_nothing_fall_back'
+  mapping: 'root = [this.a.or("x"), this.b.or("y")]'
+  inputs: ['{"a":null}', '{"a":1,"b":2}']
+# ---- prefix NOT --------------------------------------------------------------
+# `!` is a truthiness test, distinct from arithmetic `-`, and must not be
+# confused with the `!=` comparison.
+- id: 'not.prefix'
+  mapping: 'root = [!this.a, !this.b, !this.a && this.b]'
+  inputs: ['{"a":false,"b":true}', '{"a":true,"b":false}']
+- id: 'not.does_not_eat_not_equal'
+  mapping: 'root = [this.a != this.b, !(this.a == this.b)]'
+  inputs: ['{"a":1,"b":2}', '{"a":1,"b":1}']
+# ---- path segments -----------------------------------------------------------
+# A numeric segment indexes an array or names an object key, decided by the
+# target's type. Float literals must not be caught by the same rule.
+- id: 'path.numeric_segment'
+  mapping: 'root = [this.items.0, this.items.5, this."0"]'
+  inputs: ['{"items":[{"a":7},{"a":8}],"0":"zero"}', '{"items":[],"0":1}']
+- id: 'path.numeric_segment_chained'
+  mapping: 'root = this.items.0.a'
+  inputs: ['{"items":[{"a":7}]}', '{"items":[]}']
+- id: 'path.float_literals_unaffected'
+  mapping: 'root = [1.5, 2.0, 0.25, -0.5]'
+  inputs: ['{}']
+# A trailing dot continues a method chain onto the next line.
+- id: 'path.dot_continuation'
+  mapping: |-
+    root.c = this.locations.
+      filter(loc -> loc.state == "WA").
+      map_each(loc -> loc.name).
+      sort().join(", ")
+  inputs: ['{"locations":[{"name":"Seattle","state":"WA"},{"name":"Austin","state":"TX"}]}']
+# ---- error provenance --------------------------------------------------------
+# A type error names where the value came from. These matter for the DIFFERENTIAL
+# specifically: the two backends build the message in different places -- the
+# interpreter at evaluation, the emitter as generated code -- and neither the
+# ctest differential nor bench/differential.sh had a single case that produced a
+# type error on a named source, so a divergence here was invisible.
+- id: 'provenance.field_path'
+  mapping: 'root = this.a.keys()'
+  inputs: ['{"a":null}', '{"a":5}', '{"a":"hi"}', '{"a":true}', '{"a":[1]}', '{"a":{"k":1}}']
+- id: 'provenance.nested_path'
+  mapping: 'root = this.a.b.uppercase()'
+  inputs: ['{"a":{"b":null}}', '{"a":{"b":7}}']
+- id: 'provenance.numeric_segment'
+  mapping: 'root = this.a.0.keys()'
+  inputs: ['{"a":[null]}', '{"a":[5]}']
+- id: 'provenance.method_target'
+  mapping: 'root = this.a.uppercase().keys()'
+  inputs: ['{"a":"hi"}']
+- id: 'provenance.function_target'
+  mapping: 'root = content().keys()'
+  inputs: ['{}']
+- id: 'provenance.string_literal'
+  mapping: 'root = "x".keys()'
+  inputs: ['{}']
+- id: 'provenance.no_source_is_undecorated'
+  mapping: 'root = (this.a + 1).keys()'
+  inputs: ['{"a":1}']

@@ -1,0 +1,22 @@
+# Build trees. The project is built out of source; any directory whose name
+# starts with `build` is one, which is how the sanitiser and warning variants
+# (build-asan, build-ubsan, build-clang, build-strict, build-warn) are kept
+# side by side.
+build*/
+
+# What `swordfish build` leaves behind when it is pointed at the working tree.
+*.o
+*.a
+*.so
+compile_commands.json
+
+# Python bytecode, left behind by the fixture generators the gates import.
+__pycache__/
+*.pyc
+
+# Editor and OS noise.
+.cache/
+.vscode/
+.idea/
+*.swp
+.DS_Store

@@ -1,0 +1,32 @@
+# workflow: named branches in explicit groups, each merging into the message so
+# a later branch reads what an earlier one wrote. `meta_path` records the
+# outcome IN THE DOCUMENT, not in message metadata, despite the name.
+# Verified to pass under redpanda-connect 4.107.2 as well.
+pipeline:
+  processors:
+    - workflow:
+        order: [ [ a ], [ b ] ]
+        branches:
+          a:
+            request_map: 'root = this.id'
+            processors:
+              - mapping: 'root = {"av": content().string() + "-A"}'
+            result_map: 'root.a = this.av'
+          b:
+            request_map: 'root = this.a'
+            processors:
+              - mapping: 'root = {"bv": content().string() + "-B"}'
+            result_map: 'root.b = this.bv'
+tests:
+  - name: branches chain in order and the outcome is recorded
+    input_batch:
+      - content: '{"id":"7"}'
+    output_batches:
+      - - json_equals:
+            id: "7"
+            a: "7-A"
+            b: "7-A-B"
+            meta:
+              workflow:
+                succeeded: [ "a", "b" ]
+

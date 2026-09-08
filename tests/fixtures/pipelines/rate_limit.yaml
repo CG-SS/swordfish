@@ -1,0 +1,26 @@
+# A `rate_limit` processor under `swordfish test`.
+#
+# The timing itself is pinned by tests/test_rate_limit_check.sh; what this adds
+# is the RESOLUTION path, which `swordfish test` reaches differently from `run`:
+# it builds a processor chain directly from a `pipeline:` block, so a document
+# level `rate_limit_resources` has to be resolved by a route that the running
+# pipeline never takes. A limit wide enough never to block keeps the fixture
+# fast, so a failure here means resolution broke rather than that the machine
+# was busy. Verified to pass under redpanda-connect 4.107.2 as well.
+pipeline:
+  processors:
+    - rate_limit: { resource: generous }
+    - mapping: 'root.seen = this.n'
+rate_limit_resources:
+  - label: generous
+    local: { count: 1000, interval: 1s }
+tests:
+  - name: a throttled batch passes through whole and in order
+    input_batch:
+      - content: '{"n":1}'
+      - content: '{"n":2}'
+      - content: '{"n":3}'
+    output_batches:
+      - - json_equals: { "seen": 1 }
+        - json_equals: { "seen": 2 }
+        - json_equals: { "seen": 3 }
